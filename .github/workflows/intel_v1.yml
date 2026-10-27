@@ -30,7 +30,9 @@ jobs:
           CODE: ${{ steps.scan.outputs.code }}
         run: |
           title="intel: open findings"
-          num=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          # Only an issue this workflow opened counts, so nobody else's issue can be taken over.
+          num=$(gh issue list --state open --author "app/github-actions" --search "\"$title\" in:title" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
           if [ "$CODE" = "0" ]; then
             if [ -n "$num" ]; then gh issue close "$num" --comment "Quiet run: nothing new."; fi
             exit 0

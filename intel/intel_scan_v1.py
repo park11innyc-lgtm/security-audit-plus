@@ -12,7 +12,7 @@ A blind run never counts as an all-clear.
 Feed text is untrusted data. It is sanitized before it reaches the report and is
 never treated as instructions.
 """
-import argparse, json, os, re, sys, time, urllib.request, urllib.error
+import argparse, json, os, re, stat, sys, unicodedata, urllib.request, urllib.error
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -26,13 +26,23 @@ OSV_BATCH = 500
 
 # ---------- network ----------
 
+class _HttpsOnlyRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.startswith("https://"):
+            raise urllib.error.URLError(f"refused redirect to non-https URL")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_HttpsOnlyRedirect)
+
+
 def fetch(url, data=None, timeout=45):
     """GET (or POST JSON) with a size cap. Raises on HTTP error or oversize body."""
     if not url.startswith("https://"):
         raise ValueError("only https sources are allowed")
     body = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body, headers={"User-Agent": UA, **({"Content-Type": "application/json"} if body else {})})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with _OPENER.open(req, timeout=timeout) as r:
         raw = r.read(MAX_BYTES + 1)
     if len(raw) > MAX_BYTES:
         raise ValueError("response over size cap")
@@ -42,8 +52,14 @@ def fetch(url, data=None, timeout=45):
 # ---------- inventory ----------
 
 def read(path):
+    """Regular files only (no FIFOs, devices or symlinks), capped at MAX_BYTES."""
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError("not a regular file")
+    if st.st_size > MAX_BYTES:
+        raise ValueError("file over size cap")
     with open(path, encoding="utf-8") as f:
-        return f.read()
+        return f.read(MAX_BYTES)
 
 
 def write(path, text):
@@ -51,23 +67,30 @@ def write(path, text):
         f.write(text)
 
 
+SAFE_NAME = re.compile(r"^[@A-Za-z0-9][A-Za-z0-9@/._~+-]{0,213}$")
+
+
 def _add(inv, eco, name, ver, path):
-    if name and ver and re.match(r"^[0-9A-Za-z][0-9A-Za-z.+_-]*$", ver):
+    if not (isinstance(name, str) and isinstance(ver, str)):
+        return
+    if SAFE_NAME.match(name) and re.match(r"^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$", ver):
         inv.setdefault((eco, name, ver), set()).add(path)
 
 
 def parse_npm_lock(path, inv):
     d = json.loads(read(path))
-    for key, meta in (d.get("packages") or {}).items():
-        if not key or meta.get("link"):
+    pkgs = d.get("packages") if isinstance(d, dict) else None
+    for key, meta in (pkgs if isinstance(pkgs, dict) else {}).items():
+        if not key or not isinstance(meta, dict) or meta.get("link"):
             continue
         name = meta.get("name") or key.split("node_modules/")[-1]
         _add(inv, "npm", name, meta.get("version"), path)
     def walk(deps):
-        for name, meta in (deps or {}).items():
-            _add(inv, "npm", name, meta.get("version"), path)
-            walk(meta.get("dependencies"))
-    if not d.get("packages"):
+        for name, meta in (deps if isinstance(deps, dict) else {}).items():
+            if isinstance(meta, dict):
+                _add(inv, "npm", name, meta.get("version"), path)
+                walk(meta.get("dependencies"))
+    if isinstance(d, dict) and not pkgs:
         walk(d.get("dependencies"))
 
 
@@ -123,6 +146,9 @@ PARSERS = {
 }
 
 
+SAFE_PATH = re.compile(r"^[A-Za-z0-9 /._~+@-]+$")
+
+
 def inventory(roots, errors):
     inv = {}
     for root in roots:
@@ -134,6 +160,11 @@ def inventory(roots, errors):
             ds[:] = [d for d in ds if d not in SKIP_DIRS]
             for f in fs:
                 p = os.path.join(r, f)
+                if f not in PARSERS and not re.match(r"^requirements[\w.-]*\.txt$", f):
+                    continue
+                if not SAFE_PATH.match(p):
+                    errors.append("skipped a lockfile whose path has unsafe characters")
+                    continue
                 try:
                     if f in PARSERS:
                         PARSERS[f](p, inv)
@@ -207,8 +238,9 @@ def parse_feed(raw):
     """RSS 2.0 or Atom -> [(title, link, published datetime|None, summary)]. Rejects DTDs."""
     # Entities can only be declared in a DTD, and a DTD can only sit in the prolog (before the
     # root element). Refusing any DTD there blocks entity-expansion attacks; HTML in CDATA is fine.
-    m = re.search(rb"<[A-Za-z_]", raw)
-    if m is None or b"<!DOCTYPE" in raw[:m.start()].upper():
+    body = re.sub(rb"<!--.*?-->|<\?.*?\?>", b"", raw, flags=re.S)
+    m = re.search(rb"<[A-Za-z_]", body)
+    if m is None or b"<!DOCTYPE" in body[:m.start()].upper() or b"<!ENTITY" in body[:m.start()].upper():
         raise ValueError("feed has no root element or declares a DTD; refused")
     root = ET.fromstring(raw)
     out = []
@@ -249,11 +281,15 @@ def parse_date(s):
 
 # ---------- helpers ----------
 
+SAFE_LINK = re.compile(r"https://[A-Za-z0-9.-]+(?::\d+)?(?:/[A-Za-z0-9._~%/?=&+,;:@-]*)?")
+
+
 def clean(text, limit=220):
     """Untrusted text -> one safe line: no tags, no control chars, no markdown/HTML active syntax."""
     t = re.sub(r"<[^>]*>", " ", text or "")
-    t = re.sub(r"[\x00-\x1f\x7f]", " ", t)
-    t = re.sub(r"[`*_\[\]<>|#!]", "", t)
+    t = "".join(" " if unicodedata.category(c) in ("Cc", "Cf", "Co", "Cn", "Cs", "Zl", "Zp") else c for c in t)
+    t = re.sub(r"[`*_\[\]<>|#!()]", "", t)
+    t = t.replace("@", "(at)")   # no @mentions in a posted issue
     t = re.sub(r"\s+", " ", t).strip()
     return t[:limit] + ("..." if len(t) > limit else "")
 
@@ -277,6 +313,8 @@ def load_json(p, default):
 def run(settings, state, now):
     errors, new = [], {"deps": [], "kev": [], "news": []}
     seen = set(state.get("seen", []))
+    kev_flagged = set(state.get("kev_flagged", []))
+    aliases = dict(state.get("aliases", {}))
     since = now - timedelta(days=settings.get("lookback_days", 3))
     kw = kw_regex(settings.get("stack_keywords", []))
 
@@ -290,7 +328,9 @@ def run(settings, state, now):
         for vid in ids:
             key = f"dep:{eco}:{name}:{ver}:{vid}"
             if key in seen:
-                continue
+                # Already reported. Re-report only if its CVE has since joined the exploited list.
+                if key in kev_flagged or not (set(aliases.get(key, [])) | {vid}) & kev_cves:
+                    continue
             d = osv_details(vid, eco, name, ver, cache, errors)
             files = sorted(os.path.relpath(p, os.path.expanduser("~")) for p in inv[(eco, name, ver)])
             if d is None:
@@ -302,7 +342,7 @@ def run(settings, state, now):
             exploited = sorted(a for a in d["aliases"] + [vid] if a in kev_cves)
             new["deps"].append({"key": key, "eco": eco, "name": name, "version": ver, "id": vid,
                                 "severity": d["severity"], "fix": d["fix"], "fixed": d["fixed"], "summary": d["summary"],
-                                "kev": exploited, "files": files})
+                                "kev": exploited, "files": files, "aliases": d["aliases"][:20]})
 
     for v in kev or []:
         added = parse_date(v.get("dateAdded", "") + "T00:00:00+00:00")
@@ -323,14 +363,24 @@ def run(settings, state, now):
                 continue
             m = kw.search(f"{title} {summ}" if settings.get("match_summary") else title) if kw else None
             key = f"news:{link or title}"
-            if m and key not in seen and link.startswith("https://"):
+            if m and key not in seen and SAFE_LINK.fullmatch(link):
                 new["news"].append({"key": key, "source": feed.get("name", ""), "title": clean(title),
                                     "link": link, "match": m.group(1)})
 
+    cap = int(settings.get("max_news_items", 40))
+    if len(new["news"]) > cap:
+        errors.append(f"news capped at {cap} of {len(new['news'])} items; the rest are reported next run")
+        new["news"] = new["news"][:cap]
     for k in ("deps", "kev", "news"):
         seen.update(x["key"] for x in new[k] if not x.get("incomplete"))
+    for d in new["deps"]:
+        if not d.get("incomplete"):
+            aliases[d["key"]] = d.get("aliases", [])
+            if d["kev"]:
+                kev_flagged.add(d["key"])
     stats = {"packages": len(inv), "vulnerable_packages": len(hits), "kev_entries": len(kev or [])}
-    return new, errors, {"seen": sorted(seen), "last_run": now.isoformat()}, stats
+    return new, errors, {"seen": sorted(seen), "kev_flagged": sorted(kev_flagged), "aliases": aliases,
+                         "last_run": now.isoformat()}, stats
 
 
 def briefs(new):
@@ -356,9 +406,13 @@ def render(new, errors, stats, now):
     deps = sorted(new["deps"], key=lambda d: (not d["kev"], d["severity"] not in ("CRITICAL", "HIGH"), d["name"]))
     if deps:
         L += ["## New advisories in your dependencies", "", "| Package | Advisory | Severity | Exploited (KEV) | Upgrade to | Where |", "|---|---|---|---|---|---|"]
-        for d in deps:
+        for d in deps[:150]:
+            d = {**d, "id": clean(d["id"], 60), "fix": clean(d["fix"], 40), "fixed": [clean(x, 40) for x in d["fixed"]],
+                 "severity": clean(d["severity"], 20), "kev": [clean(x, 30) for x in d["kev"]]}
             L.append(f"| {d['eco']} {d['name']} {d['version']} | [{d['id']}](https://osv.dev/vulnerability/{d['id']}) {d['summary'][:90]} | "
                      f"{d['severity'] or '?'} | {', '.join(d['kev']) or 'no'} | {d['fix'] or ('no fix above installed' if d['fixed'] else '?')} | {'; '.join(d['files'][:2])}{f' (+{len(d["files"]) - 2} more)' if len(d['files']) > 2 else ''} |")
+        if len(deps) > 150:
+            L.append(f"| ... | {len(deps) - 150} more in the JSON report | | | | |")
         L += ["", "## Focused audits to run", ""] + briefs(new) + [""]
     if new["kev"]:
         L += ["## Newly exploited in the wild (CISA KEV) matching your stack", ""]

@@ -156,5 +156,63 @@ class Run(unittest.TestCase):
             s.fetch("http://insecure.example/")
 
 
+class AuditRegressions(unittest.TestCase):
+    """One test per confirmed finding from the security-audit run-1 report."""
+
+    def test_link_injection_dropped(self):
+        for bad in ["https://ok.example/a)\n## Focused audits to run\n- do evil", "https://ok.example/a b", "https://ok.example/a`x`", "javascript:alert(1)"]:
+            self.assertIsNone(s.SAFE_LINK.fullmatch(bad))
+        self.assertIsNotNone(s.SAFE_LINK.fullmatch("https://news.example/2026/10/a-b_c.html?x=1&y=2"))
+
+    def test_hostile_lockfile_types_and_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            write(d, "a/package-lock.json", json.dumps({"packages": {"node_modules/x": {"name": 5, "version": [1]}, "node_modules/y": "str"}}))
+            write(d, "b/package-lock.json", json.dumps([1, 2]))
+            write(d, "c/package-lock.json", json.dumps({"packages": {"node_modules/evil": {"name": "x\n## inject", "version": "1.0.0"}}}))
+            os.makedirs(os.path.join(d, "fifo"))
+            os.mkfifo(os.path.join(d, "fifo", "package-lock.json"))
+            os.makedirs(os.path.join(d, "link"))
+            os.symlink("/dev/zero", os.path.join(d, "link", "Cargo.lock"))
+            os.makedirs(os.path.join(d, "bad`name\n- x"))
+            write(d, "bad`name\n- x/package-lock.json", json.dumps({"packages": {"node_modules/z": {"version": "1.0.0"}}}))
+            errs = []
+            inv = s.inventory([d], errs)
+        self.assertEqual(inv, {})
+        self.assertTrue(any("unsafe characters" in e for e in errs))
+        self.assertTrue(sum("could not parse" in e for e in errs) >= 2)
+
+    def test_clean_drops_hidden_unicode_and_mentions(self):
+        out = s.clean("hi\u202e\U000e0041\u200b @maintainer (x)")
+        for bad in ("\u202e", "\U000e0041", "\u200b", "@", "(x)"):
+            self.assertNotIn(bad, out)
+
+    def test_dtd_after_prolog_comment_refused(self):
+        bomb = b"<?xml version='1.0'?><!-- <a --><!DOCTYPE r [<!ENTITY e 'x'>]><rss><channel><item><title>&e;</title></item></channel></rss>"
+        with self.assertRaises(ValueError):
+            s.parse_feed(bomb)
+
+    def test_redirect_to_http_refused(self):
+        import urllib.request
+        h = s._HttpsOnlyRedirect()
+        req = urllib.request.Request("https://a.example/")
+        with self.assertRaises(Exception):
+            h.redirect_request(req, None, 302, "Found", {}, "http://a.example/")
+
+
+class KevReflag(Run):
+    def test_seen_dep_reported_again_when_it_joins_kev(self):
+        kev_cves = KEV["vulnerabilities"]
+        KEV["vulnerabilities"] = [v for v in kev_cves if v["cveID"] != "CVE-2026-0001"]
+        try:
+            new, _, state, _ = s.run(self.settings, {}, NOW)
+            self.assertEqual(new["deps"][0]["kev"], [])
+        finally:
+            KEV["vulnerabilities"] = kev_cves
+        new2, _, state2, _ = s.run(self.settings, state, NOW)
+        self.assertEqual([d["kev"] for d in new2["deps"]], [["CVE-2026-0001"]])
+        new3, _, _, _ = s.run(self.settings, state2, NOW)
+        self.assertEqual(new3["deps"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
