@@ -1,0 +1,19 @@
+{
+  "_note": "Tunables for intel_scan_v1.py. Edit here; the next run picks them up. Put machine-specific roots in SETTINGS.local.json (gitignored) and pass --settings.",
+  "roots": ["."],
+  "lookback_days": 3,
+  "match_summary": false,
+  "stack_keywords": [
+    "Node.js", "npm", "Next.js", "React", "Python", "pip", "PyPI", "Rust", "Solana", "Anchor",
+    "PostgreSQL", "Supabase", "Cloudflare", "GitHub Actions", "GitHub", "Chrome", "Chromium",
+    "macOS", "Windows", "OpenSSH", "Docker", "Vercel", "MCP", "Model Context Protocol",
+    "Claude", "Anthropic", "OpenAI", "LLM", "prompt injection", "supply chain", "ffmpeg", "yt-dlp"
+  ],
+  "news_feeds": [
+    {"name": "CISA advisories", "url": "https://www.cisa.gov/cybersecurity-advisories/all.xml"},
+    {"name": "GitHub security blog", "url": "https://github.blog/security/feed/"},
+    {"name": "The Hacker News", "url": "https://feeds.feedburner.com/TheHackersNews"},
+    {"name": "BleepingComputer", "url": "https://www.bleepingcomputer.com/feed/"},
+    {"name": "Krebs on Security", "url": "https://krebsonsecurity.com/feed/"}
+  ]
+}

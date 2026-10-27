@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""intel_scan_v1 - threat-intel scanner for the security-audit skill.
+
+Builds a dependency inventory from lockfiles under the configured roots, checks it
+against OSV.dev, flags anything also on the CISA Known Exploited Vulnerabilities
+list, and scans security news feeds for your stack keywords. Reports only what is
+new since the last run. Stdlib only.
+
+Exit codes: 0 = quiet, 2 = new findings, 3 = a source could not be read (blind).
+A blind run never counts as an all-clear.
+
+Feed text is untrusted data. It is sanitized before it reaches the report and is
+never treated as instructions.
+"""
+import argparse, json, os, re, sys, time, urllib.request, urllib.error
+import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+UA = "security-audit-plus-intel/1"
+MAX_BYTES = 8 * 1024 * 1024
+SKIP_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", "target", ".next", "dist", "build"}
+OSV_BATCH = 500
+
+
+# ---------- network ----------
+
+def fetch(url, data=None, timeout=45):
+    """GET (or POST JSON) with a size cap. Raises on HTTP error or oversize body."""
+    if not url.startswith("https://"):
+        raise ValueError("only https sources are allowed")
+    body = json.dumps(data).encode() if data is not None else None
+    req = urllib.request.Request(url, data=body, headers={"User-Agent": UA, **({"Content-Type": "application/json"} if body else {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read(MAX_BYTES + 1)
+    if len(raw) > MAX_BYTES:
+        raise ValueError("response over size cap")
+    return raw
+
+
+# ---------- inventory ----------
+
+def read(path):
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def write(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _add(inv, eco, name, ver, path):
+    if name and ver and re.match(r"^[0-9A-Za-z][0-9A-Za-z.+_-]*$", ver):
+        inv.setdefault((eco, name, ver), set()).add(path)
+
+
+def parse_npm_lock(path, inv):
+    d = json.loads(read(path))
+    for key, meta in (d.get("packages") or {}).items():
+        if not key or meta.get("link"):
+            continue
+        name = meta.get("name") or key.split("node_modules/")[-1]
+        _add(inv, "npm", name, meta.get("version"), path)
+    def walk(deps):
+        for name, meta in (deps or {}).items():
+            _add(inv, "npm", name, meta.get("version"), path)
+            walk(meta.get("dependencies"))
+    if not d.get("packages"):
+        walk(d.get("dependencies"))
+
+
+PNPM_KEY = re.compile(r"^  '?/?((?:@[^/@\s']+/)?[^@\s'/]+)[@/]([0-9][^():'\s]*)")
+
+def parse_pnpm_lock(path, inv):
+    in_pkgs = False
+    for line in read(path).splitlines(True):
+        if re.match(r"^(packages|snapshots):\s*$", line):
+            in_pkgs = True
+            continue
+        if in_pkgs and re.match(r"^\S", line):
+            in_pkgs = False
+        if in_pkgs:
+            m = PNPM_KEY.match(line)
+            if m:
+                _add(inv, "npm", m.group(1), m.group(2), path)
+
+
+def parse_requirements(path, inv):
+    for line in read(path).splitlines(True):
+        m = re.match(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*==\s*([0-9][^\s;#]*)", line)
+        if m:
+            _add(inv, "PyPI", m.group(1).lower(), m.group(2), path)
+
+
+def parse_toml_lock(path, inv, eco):
+    """poetry.lock, uv.lock and Cargo.lock all use [[package]] blocks with name/version."""
+    name = ver = None
+    for line in read(path).splitlines(True):
+        if line.startswith("[[package]]"):
+            if name and ver:
+                _add(inv, eco, name.lower() if eco == "PyPI" else name, ver, path)
+            name = ver = None
+            continue
+        m = re.match(r'^(name|version)\s*=\s*"([^"]+)"', line)
+        if m:
+            if m.group(1) == "name":
+                name = m.group(2)
+            else:
+                ver = m.group(2)
+    if name and ver:
+        _add(inv, eco, name.lower() if eco == "PyPI" else name, ver, path)
+
+
+PARSERS = {
+    "package-lock.json": parse_npm_lock,
+    "npm-shrinkwrap.json": parse_npm_lock,
+    "pnpm-lock.yaml": parse_pnpm_lock,
+    "poetry.lock": lambda p, i: parse_toml_lock(p, i, "PyPI"),
+    "uv.lock": lambda p, i: parse_toml_lock(p, i, "PyPI"),
+    "Cargo.lock": lambda p, i: parse_toml_lock(p, i, "crates.io"),
+}
+
+
+def inventory(roots, errors):
+    inv = {}
+    for root in roots:
+        root = os.path.expanduser(root)
+        if not os.path.isdir(root):
+            errors.append(f"root not found: {root}")
+            continue
+        for r, ds, fs in os.walk(root):
+            ds[:] = [d for d in ds if d not in SKIP_DIRS]
+            for f in fs:
+                p = os.path.join(r, f)
+                try:
+                    if f in PARSERS:
+                        PARSERS[f](p, inv)
+                    elif re.match(r"^requirements[\w.-]*\.txt$", f):
+                        parse_requirements(p, inv)
+                except Exception as e:
+                    errors.append(f"could not parse {p}: {type(e).__name__}")
+    return inv
+
+
+# ---------- sources ----------
+
+def osv_check(inv, errors):
+    """Returns {(eco,name,ver): [vuln ids]}."""
+    keys = sorted(inv)
+    hits = {}
+    for i in range(0, len(keys), OSV_BATCH):
+        chunk = keys[i:i + OSV_BATCH]
+        q = {"queries": [{"package": {"ecosystem": e, "name": n}, "version": v} for e, n, v in chunk]}
+        try:
+            res = json.loads(fetch("https://api.osv.dev/v1/querybatch", q)).get("results", [])
+        except Exception as e:
+            errors.append(f"OSV batch {i // OSV_BATCH + 1} unreadable: {type(e).__name__}")
+            continue
+        if len(res) != len(chunk):
+            errors.append(f"OSV batch {i // OSV_BATCH + 1} returned {len(res)} of {len(chunk)} results")
+        for k, r in zip(chunk, res):
+            ids = [v["id"] for v in (r.get("vulns") or [])]
+            if ids:
+                hits[k] = ids
+    return hits
+
+
+def osv_details(vid, cache, errors):
+    if vid in cache:
+        return cache[vid]
+    try:
+        d = json.loads(fetch(f"https://api.osv.dev/v1/vulns/{urllib.request.quote(vid)}"))
+    except Exception as e:
+        errors.append(f"OSV detail {vid} unreadable: {type(e).__name__}")
+        d = {}
+    sev = ""
+    for s in (d.get("database_specific") or {}, *[a.get("database_specific") or {} for a in d.get("affected", [])]):
+        if s.get("severity"):
+            sev = str(s["severity"]).upper()
+            break
+    fixed = sorted({ev["fixed"] for a in d.get("affected", []) for rg in a.get("ranges", []) for ev in rg.get("events", []) if "fixed" in ev})
+    cache[vid] = {"summary": clean(d.get("summary", "")), "aliases": d.get("aliases", []), "severity": sev, "fixed": fixed[:3]}
+    return cache[vid]
+
+
+def kev_feed(errors):
+    try:
+        return json.loads(fetch("https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json")).get("vulnerabilities", [])
+    except Exception as e:
+        errors.append(f"CISA KEV unreadable: {type(e).__name__}")
+        return None
+
+
+def parse_feed(raw):
+    """RSS 2.0 or Atom -> [(title, link, published datetime|None, summary)]. Rejects DTDs."""
+    # Entities can only be declared in a DTD, and a DTD can only sit in the prolog (before the
+    # root element). Refusing any DTD there blocks entity-expansion attacks; HTML in CDATA is fine.
+    m = re.search(rb"<[A-Za-z_]", raw)
+    if m is None or b"<!DOCTYPE" in raw[:m.start()].upper():
+        raise ValueError("feed has no root element or declares a DTD; refused")
+    root = ET.fromstring(raw)
+    out = []
+    strip = lambda t: re.sub(r"^\{[^}]+\}", "", t)
+    for el in root.iter():
+        if strip(el.tag) not in ("item", "entry"):
+            continue
+        f = {strip(c.tag): c for c in el}
+        title = (f.get("title").text if f.get("title") is not None else "") or ""
+        link = ""
+        if f.get("link") is not None:
+            link = f["link"].get("href") or (f["link"].text or "")
+        date = None
+        for k in ("pubDate", "published", "updated", "date"):
+            if f.get(k) is not None and f[k].text:
+                date = parse_date(f[k].text.strip())
+                if date:
+                    break
+        summ = ""
+        for k in ("description", "summary", "content"):
+            if f.get(k) is not None and f[k].text:
+                summ = f[k].text
+                break
+        out.append((title, link.strip(), date, summ))
+    return out
+
+
+def parse_date(s):
+    try:
+        d = parsedate_to_datetime(s)
+    except Exception:
+        try:
+            d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+# ---------- helpers ----------
+
+def clean(text, limit=220):
+    """Untrusted text -> one safe line: no tags, no control chars, no markdown/HTML active syntax."""
+    t = re.sub(r"<[^>]*>", " ", text or "")
+    t = re.sub(r"[\x00-\x1f\x7f]", " ", t)
+    t = re.sub(r"[`*_\[\]<>|#!]", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:limit] + ("..." if len(t) > limit else "")
+
+
+def kw_regex(words):
+    words = [w for w in words if w.strip()]
+    if not words:
+        return None
+    return re.compile(r"(?<![A-Za-z0-9])(" + "|".join(re.escape(w) for w in sorted(words, key=len, reverse=True)) + r")(?![A-Za-z0-9])", re.I)
+
+
+def load_json(p, default):
+    try:
+        return json.loads(read(p))
+    except FileNotFoundError:
+        return default
+
+
+# ---------- main ----------
+
+def run(settings, state, now):
+    errors, new = [], {"deps": [], "kev": [], "news": []}
+    seen = set(state.get("seen", []))
+    since = now - timedelta(days=settings.get("lookback_days", 3))
+    kw = kw_regex(settings.get("stack_keywords", []))
+
+    inv = inventory(settings.get("roots", []), errors)
+    kev = kev_feed(errors)
+    kev_cves = {v.get("cveID") for v in (kev or [])}
+
+    hits = osv_check(inv, errors) if inv else {}
+    cache = {}
+    for (eco, name, ver), ids in sorted(hits.items()):
+        for vid in ids:
+            key = f"dep:{eco}:{name}:{ver}:{vid}"
+            if key in seen:
+                continue
+            d = osv_details(vid, cache, errors)
+            exploited = sorted(a for a in d["aliases"] + [vid] if a in kev_cves)
+            new["deps"].append({"key": key, "eco": eco, "name": name, "version": ver, "id": vid,
+                                "severity": d["severity"], "fixed": d["fixed"], "summary": d["summary"],
+                                "kev": exploited, "files": sorted(os.path.relpath(p, os.path.expanduser("~")) for p in inv[(eco, name, ver)])[:5]})
+
+    for v in kev or []:
+        added = parse_date(v.get("dateAdded", "") + "T00:00:00+00:00")
+        text = f"{v.get('vendorProject', '')} {v.get('product', '')} {v.get('vulnerabilityName', '')}"
+        key = f"kev:{v.get('cveID')}"
+        if added and added >= since and kw and kw.search(text) and key not in seen:
+            new["kev"].append({"key": key, "cve": v.get("cveID"), "what": clean(text), "due": v.get("dueDate", ""),
+                               "ransomware": v.get("knownRansomwareCampaignUse", "") == "Known"})
+
+    for feed in settings.get("news_feeds", []):
+        try:
+            items = parse_feed(fetch(feed["url"]))
+        except Exception as e:
+            errors.append(f"feed {feed.get('name', feed['url'])} unreadable: {type(e).__name__}")
+            continue
+        for title, link, date, summ in items:
+            if date and date < since:
+                continue
+            m = kw.search(f"{title} {summ}" if settings.get("match_summary") else title) if kw else None
+            key = f"news:{link or title}"
+            if m and key not in seen and link.startswith("https://"):
+                new["news"].append({"key": key, "source": feed.get("name", ""), "title": clean(title),
+                                    "link": link, "match": m.group(1)})
+
+    for k in ("deps", "kev", "news"):
+        seen.update(x["key"] for x in new[k])
+    stats = {"packages": len(inv), "vulnerable_packages": len(hits), "kev_entries": len(kev or [])}
+    return new, errors, {"seen": sorted(seen), "last_run": now.isoformat()}, stats
+
+
+def briefs(new):
+    """One focused-audit brief per affected lockfile: the 'check yourself' step."""
+    by_file = {}
+    for d in new["deps"]:
+        for f in d["files"]:
+            by_file.setdefault(f, []).append(d)
+    out = []
+    for f, ds in sorted(by_file.items()):
+        lines = ", ".join(f"{d['name']} {d['version']} ({d['id']})" for d in ds[:8])
+        out.append(f"- `{f}`: use the security-audit skill in guidance mode. For {lines}: confirm whether the vulnerable "
+                   f"code path is reachable from an untrusted input in this project, then upgrade to the fixed version. "
+                   f"Fails if the upgrade changes behaviour the tests cover.")
+    return out
+
+
+def render(new, errors, stats, now):
+    L = [f"# Threat intel: {now:%Y-%m-%d %H:%M} UTC", "",
+         f"Scanned {stats['packages']} pinned packages; {stats['vulnerable_packages']} have known advisories; KEV list size {stats['kev_entries']}.", ""]
+    if errors:
+        L += ["## PARTLY BLIND: these sources could not be read, so this is not an all-clear", ""] + [f"- {e}" for e in errors] + [""]
+    deps = sorted(new["deps"], key=lambda d: (not d["kev"], d["severity"] not in ("CRITICAL", "HIGH"), d["name"]))
+    if deps:
+        L += ["## New advisories in your dependencies", "", "| Package | Advisory | Severity | Exploited (KEV) | Fixed in | Where |", "|---|---|---|---|---|---|"]
+        for d in deps:
+            L.append(f"| {d['eco']} {d['name']} {d['version']} | [{d['id']}](https://osv.dev/vulnerability/{d['id']}) {d['summary'][:90]} | "
+                     f"{d['severity'] or '?'} | {', '.join(d['kev']) or 'no'} | {', '.join(d['fixed']) or '?'} | {'; '.join(d['files'][:2])} |")
+        L += ["", "## Focused audits to run", ""] + briefs(new) + [""]
+    if new["kev"]:
+        L += ["## Newly exploited in the wild (CISA KEV) matching your stack", ""]
+        L += [f"- {k['cve']}: {k['what']} (federal due date {k['due']}{', used by ransomware' if k['ransomware'] else ''})" for k in new["kev"]] + [""]
+    if new["news"]:
+        L += ["## Security news mentioning your stack", ""]
+        L += [f"- [{n['title']}]({n['link']}) ({n['source']}, matched \"{clean(n['match'], 40)}\")" for n in new["news"]] + [""]
+    if not (deps or new["kev"] or new["news"] or errors):
+        L += ["Nothing new since the last run."]
+    return "\n".join(L)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--settings", default=os.path.join(HERE, "SETTINGS_v1.json"))
+    ap.add_argument("--state", default=os.path.join(HERE, "state", "seen_v1.json"))
+    ap.add_argument("--out", default=os.path.join(HERE, "reports"))
+    ap.add_argument("--no-save", action="store_true", help="do not update the seen-state file")
+    a = ap.parse_args(argv)
+
+    settings = load_json(a.settings, None)
+    if settings is None:
+        print(f"settings not found: {a.settings}", file=sys.stderr)
+        return 3
+    now = datetime.now(timezone.utc)
+    new, errors, state, stats = run(settings, load_json(a.state, {}), now)
+    report = render(new, errors, stats, now)
+
+    os.makedirs(a.out, exist_ok=True)
+    stamp = now.strftime("%Y%m%d-%H%M")
+    write(os.path.join(a.out, f"intel_{stamp}.md"), report + "\n")
+    write(os.path.join(a.out, f"intel_{stamp}.json"), json.dumps({"new": new, "errors": errors, "stats": stats}, indent=1))
+    if not a.no_save:
+        os.makedirs(os.path.dirname(a.state), exist_ok=True)
+        tmp = a.state + ".tmp"
+        write(tmp, json.dumps(state, indent=0))
+        os.replace(tmp, a.state)
+    print(report)
+    if errors:
+        return 3
+    return 2 if any(new.values()) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

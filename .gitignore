@@ -1,0 +1,5 @@
+intel/state/
+intel/reports/
+intel/SETTINGS.local.json
+__pycache__/
+*.pyc
