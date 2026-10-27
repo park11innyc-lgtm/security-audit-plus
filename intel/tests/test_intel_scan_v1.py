@@ -213,6 +213,12 @@ class KevReflag(Run):
         new3, _, _, _ = s.run(self.settings, state2, NOW)
         self.assertEqual(new3["deps"], [])
 
+    def test_old_state_without_aliases_still_reflags(self):
+        old_state = {"seen": ["dep:npm:next:15.0.0:GHSA-test"]}
+        new, _, state, _ = s.run(self.settings, old_state, NOW)
+        self.assertEqual([d["kev"] for d in new["deps"]], [["CVE-2026-0001"]])
+        self.assertIn("dep:npm:next:15.0.0:GHSA-test", state["alias_checked"])
+
 
 if __name__ == "__main__":
     unittest.main()

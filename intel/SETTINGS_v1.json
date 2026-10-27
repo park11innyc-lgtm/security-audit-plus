@@ -3,6 +3,8 @@
   "roots": ["."],
   "lookback_days": 3,
   "match_summary": false,
+  "alias_refresh_days": 7,
+  "max_news_items": 40,
   "stack_keywords": [
     "Node.js", "npm", "Next.js", "React", "Python", "pip", "PyPI", "Rust", "Solana", "Anchor",
     "PostgreSQL", "Supabase", "Cloudflare", "GitHub Actions", "GitHub", "Chrome", "Chromium",

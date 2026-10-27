@@ -315,6 +315,8 @@ def run(settings, state, now):
     seen = set(state.get("seen", []))
     kev_flagged = set(state.get("kev_flagged", []))
     aliases = dict(state.get("aliases", {}))
+    checked = dict(state.get("alias_checked", {}))
+    refresh = timedelta(days=settings.get("alias_refresh_days", 7))
     since = now - timedelta(days=settings.get("lookback_days", 3))
     kw = kw_regex(settings.get("stack_keywords", []))
 
@@ -329,7 +331,16 @@ def run(settings, state, now):
             key = f"dep:{eco}:{name}:{ver}:{vid}"
             if key in seen:
                 # Already reported. Re-report only if its CVE has since joined the exploited list.
-                if key in kev_flagged or not (set(aliases.get(key, [])) | {vid}) & kev_cves:
+                if key in kev_flagged:
+                    continue
+                last = parse_date(checked.get(key, ""))
+                if key not in aliases or last is None or now - last >= refresh:
+                    # Old state, or OSV may have assigned a CVE since: refresh the aliases.
+                    fresh = osv_details(vid, eco, name, ver, cache, errors)
+                    if fresh is not None:
+                        aliases[key] = fresh["aliases"][:20]
+                        checked[key] = now.isoformat()
+                if not (set(aliases.get(key, [])) | {vid}) & kev_cves:
                     continue
             d = osv_details(vid, eco, name, ver, cache, errors)
             files = sorted(os.path.relpath(p, os.path.expanduser("~")) for p in inv[(eco, name, ver)])
@@ -376,11 +387,12 @@ def run(settings, state, now):
     for d in new["deps"]:
         if not d.get("incomplete"):
             aliases[d["key"]] = d.get("aliases", [])
+            checked[d["key"]] = now.isoformat()
             if d["kev"]:
                 kev_flagged.add(d["key"])
     stats = {"packages": len(inv), "vulnerable_packages": len(hits), "kev_entries": len(kev or [])}
     return new, errors, {"seen": sorted(seen), "kev_flagged": sorted(kev_flagged), "aliases": aliases,
-                         "last_run": now.isoformat()}, stats
+                         "alias_checked": checked, "last_run": now.isoformat()}, stats
 
 
 def briefs(new):
