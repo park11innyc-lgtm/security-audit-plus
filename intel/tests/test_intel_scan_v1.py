@@ -76,6 +76,7 @@ class Run(unittest.TestCase):
                          "news_feeds": [{"name": "rss", "url": "https://feed.example/rss"}, {"name": "atom", "url": "https://feed.example/atom"}]}
         self.real = s.fetch
         self.down = set()
+        self.detail_down = False
 
         def fake(url, data=None, timeout=45):
             if any(x in url for x in self.down):
@@ -83,8 +84,11 @@ class Run(unittest.TestCase):
             if url.endswith("/querybatch"):
                 return json.dumps({"results": [{"vulns": [{"id": "GHSA-test"}]} if q["package"]["name"] == "next" else {} for q in data["queries"]]}).encode()
             if "/v1/vulns/" in url:
+                if self.detail_down:
+                    raise OSError("detail down")
                 return json.dumps({"summary": "Auth bypass in **next**", "aliases": ["CVE-2026-0001"], "database_specific": {"severity": "critical"},
-                                   "affected": [{"ranges": [{"events": [{"introduced": "0"}, {"fixed": "15.0.5"}]}]}]}).encode()
+                                   "affected": [{"package": {"ecosystem": "npm", "name": "next"}, "ranges": [{"events": [{"introduced": "0"}, {"fixed": "14.2.30"}, {"introduced": "15.0.0"}, {"fixed": "15.0.10"}, {"fixed": "15.0.5"}]}]},
+                                                {"package": {"ecosystem": "npm", "name": "other-pkg"}, "ranges": [{"events": [{"fixed": "1.0.0"}]}]}]}).encode()
             if "known_exploited" in url:
                 return json.dumps(KEV).encode()
             return {"https://feed.example/rss": RSS, "https://feed.example/atom": ATOM}[url]
@@ -99,7 +103,8 @@ class Run(unittest.TestCase):
         self.assertEqual(errs, [])
         self.assertEqual(stats["packages"], 2)
         (dep,) = new["deps"]
-        self.assertEqual((dep["name"], dep["severity"], dep["kev"], dep["fixed"]), ("next", "CRITICAL", ["CVE-2026-0001"], ["15.0.5"]))
+        self.assertEqual((dep["name"], dep["severity"], dep["kev"], dep["fixed"]), ("next", "CRITICAL", ["CVE-2026-0001"], ["14.2.30", "15.0.5", "15.0.10"]))
+        self.assertEqual(dep["fix"], "15.0.5")
         self.assertEqual([k["cve"] for k in new["kev"]], ["CVE-2026-0001"])
         self.assertEqual(sorted(n["link"] for n in new["news"]), ["https://news.example/a", "https://news.example/c"])
         report = s.render(new, errs, stats, NOW)
@@ -116,6 +121,34 @@ class Run(unittest.TestCase):
         report = s.render(new, errs, stats, NOW)
         self.assertIn("PARTLY BLIND", report)
         self.assertNotIn("Nothing new", report)
+
+    def test_failed_detail_is_retried_next_run(self):
+        self.detail_down = True
+        new, errs, state, _ = s.run(self.settings, {}, NOW)
+        self.assertTrue(new["deps"][0]["incomplete"])
+        self.assertTrue(any("detail" in e for e in errs))
+        self.detail_down = False
+        new2, _, _, _ = s.run(self.settings, state, NOW)
+        self.assertEqual(new2["deps"][0]["fix"], "15.0.5")
+
+    def test_all_affected_files_kept(self):
+        for i in range(7):
+            write(self.d.name, f"copy{i}/package-lock.json", json.dumps({"packages": {"node_modules/next": {"version": "15.0.0"}}}))
+        new, _, _, _ = s.run(self.settings, {}, NOW)
+        self.assertEqual(len(new["deps"][0]["files"]), 8)
+        self.assertEqual(len(s.briefs(new)), 8)
+
+    def test_unreadable_dir_is_an_error(self):
+        locked = os.path.join(self.d.name, "locked")
+        os.makedirs(locked)
+        os.chmod(locked, 0)
+        try:
+            errs = []
+            s.inventory([self.d.name], errs)
+            if os.geteuid() != 0:
+                self.assertTrue(any("could not read" in e for e in errs))
+        finally:
+            os.chmod(locked, 0o700)
 
     def test_https_only(self):
         s.fetch = self.real

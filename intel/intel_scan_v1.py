@@ -130,7 +130,7 @@ def inventory(roots, errors):
         if not os.path.isdir(root):
             errors.append(f"root not found: {root}")
             continue
-        for r, ds, fs in os.walk(root):
+        for r, ds, fs in os.walk(root, onerror=lambda e: errors.append(f"could not read {e.filename}: {type(e).__name__}")):
             ds[:] = [d for d in ds if d not in SKIP_DIRS]
             for f in fs:
                 p = os.path.join(r, f)
@@ -167,22 +167,32 @@ def osv_check(inv, errors):
     return hits
 
 
-def osv_details(vid, cache, errors):
-    if vid in cache:
-        return cache[vid]
-    try:
-        d = json.loads(fetch(f"https://api.osv.dev/v1/vulns/{urllib.request.quote(vid)}"))
-    except Exception as e:
-        errors.append(f"OSV detail {vid} unreadable: {type(e).__name__}")
-        d = {}
+def vkey(v):
+    """Rough version order: numeric parts compare as numbers, pre-release tags sort first."""
+    return [(0, int(x), "") if x.isdigit() else (-1, 0, x) for x in re.split(r"[.+-]", v)]
+
+
+def osv_details(vid, eco, name, ver, cache, errors):
+    """Advisory facts for one package. Returns None if the advisory could not be read;
+    failures are not cached, so the next run retries."""
+    if vid not in cache:
+        try:
+            cache[vid] = json.loads(fetch(f"https://api.osv.dev/v1/vulns/{urllib.request.quote(vid)}"))
+        except Exception as e:
+            errors.append(f"OSV detail {vid} unreadable: {type(e).__name__}")
+            return None
+    d = cache[vid]
+    mine = [a for a in d.get("affected", []) if (a.get("package") or {}).get("ecosystem") == eco
+            and (a.get("package") or {}).get("name", "").lower() == name.lower()] or d.get("affected", [])
     sev = ""
-    for s in (d.get("database_specific") or {}, *[a.get("database_specific") or {} for a in d.get("affected", [])]):
-        if s.get("severity"):
-            sev = str(s["severity"]).upper()
+    for src in (d.get("database_specific") or {}, *[a.get("database_specific") or {} for a in mine]):
+        if src.get("severity"):
+            sev = str(src["severity"]).upper()
             break
-    fixed = sorted({ev["fixed"] for a in d.get("affected", []) for rg in a.get("ranges", []) for ev in rg.get("events", []) if "fixed" in ev})
-    cache[vid] = {"summary": clean(d.get("summary", "")), "aliases": d.get("aliases", []), "severity": sev, "fixed": fixed[:3]}
-    return cache[vid]
+    fixed = sorted({ev["fixed"] for a in mine for rg in a.get("ranges", []) for ev in rg.get("events", []) if "fixed" in ev}, key=vkey)
+    above = [f for f in fixed if vkey(f) > vkey(ver)]
+    return {"summary": clean(d.get("summary", "")), "aliases": d.get("aliases", []), "severity": sev,
+            "fix": above[0] if above else "", "fixed": fixed}
 
 
 def kev_feed(errors):
@@ -281,11 +291,18 @@ def run(settings, state, now):
             key = f"dep:{eco}:{name}:{ver}:{vid}"
             if key in seen:
                 continue
-            d = osv_details(vid, cache, errors)
+            d = osv_details(vid, eco, name, ver, cache, errors)
+            files = sorted(os.path.relpath(p, os.path.expanduser("~")) for p in inv[(eco, name, ver)])
+            if d is None:
+                # Report it, but leave it unseen so the next run fills in severity, fix and KEV status.
+                new["deps"].append({"key": key, "eco": eco, "name": name, "version": ver, "id": vid, "severity": "",
+                                    "fix": "", "fixed": [], "summary": "details unavailable, retried next run",
+                                    "kev": [], "files": files, "incomplete": True})
+                continue
             exploited = sorted(a for a in d["aliases"] + [vid] if a in kev_cves)
             new["deps"].append({"key": key, "eco": eco, "name": name, "version": ver, "id": vid,
-                                "severity": d["severity"], "fixed": d["fixed"], "summary": d["summary"],
-                                "kev": exploited, "files": sorted(os.path.relpath(p, os.path.expanduser("~")) for p in inv[(eco, name, ver)])[:5]})
+                                "severity": d["severity"], "fix": d["fix"], "fixed": d["fixed"], "summary": d["summary"],
+                                "kev": exploited, "files": files})
 
     for v in kev or []:
         added = parse_date(v.get("dateAdded", "") + "T00:00:00+00:00")
@@ -311,7 +328,7 @@ def run(settings, state, now):
                                     "link": link, "match": m.group(1)})
 
     for k in ("deps", "kev", "news"):
-        seen.update(x["key"] for x in new[k])
+        seen.update(x["key"] for x in new[k] if not x.get("incomplete"))
     stats = {"packages": len(inv), "vulnerable_packages": len(hits), "kev_entries": len(kev or [])}
     return new, errors, {"seen": sorted(seen), "last_run": now.isoformat()}, stats
 
@@ -338,10 +355,10 @@ def render(new, errors, stats, now):
         L += ["## PARTLY BLIND: these sources could not be read, so this is not an all-clear", ""] + [f"- {e}" for e in errors] + [""]
     deps = sorted(new["deps"], key=lambda d: (not d["kev"], d["severity"] not in ("CRITICAL", "HIGH"), d["name"]))
     if deps:
-        L += ["## New advisories in your dependencies", "", "| Package | Advisory | Severity | Exploited (KEV) | Fixed in | Where |", "|---|---|---|---|---|---|"]
+        L += ["## New advisories in your dependencies", "", "| Package | Advisory | Severity | Exploited (KEV) | Upgrade to | Where |", "|---|---|---|---|---|---|"]
         for d in deps:
             L.append(f"| {d['eco']} {d['name']} {d['version']} | [{d['id']}](https://osv.dev/vulnerability/{d['id']}) {d['summary'][:90]} | "
-                     f"{d['severity'] or '?'} | {', '.join(d['kev']) or 'no'} | {', '.join(d['fixed']) or '?'} | {'; '.join(d['files'][:2])} |")
+                     f"{d['severity'] or '?'} | {', '.join(d['kev']) or 'no'} | {d['fix'] or ('no fix above installed' if d['fixed'] else '?')} | {'; '.join(d['files'][:2])}{f' (+{len(d["files"]) - 2} more)' if len(d['files']) > 2 else ''} |")
         L += ["", "## Focused audits to run", ""] + briefs(new) + [""]
     if new["kev"]:
         L += ["## Newly exploited in the wild (CISA KEV) matching your stack", ""]
